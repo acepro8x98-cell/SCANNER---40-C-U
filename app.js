@@ -594,28 +594,35 @@ function feedbackWarning() {
 // tỉ lệ % so với khung ảnh đã duỗi thẳng - khớp với 4 marker góc,
 // nên áp dụng đúng cho MỌI kích thước OUT_W/OUT_H)
 // ============================================================
+// LƯU Ý QUAN TRỌNG: warpPerspective() ở trên ánh xạ TÂM của 4 ô vuông
+// đen ở góc phiếu (không phải 4 góc tờ giấy) thành 4 góc của ảnh
+// OUT_W x OUT_H. Vì vậy các toạ độ % bên dưới PHẢI được tính theo hệ
+// "khung tâm 4 marker" (marker-to-marker), KHÔNG phải theo toàn bộ
+// trang giấy kể cả phần lề ngoài 4 marker - nếu không, cả lưới sẽ bị
+// lệch (đã từng xảy ra: dùng nhầm hệ toạ độ trang giấy đầy đủ khi làm
+// phiếu 40 câu, khiến các ô đọc sai vị trí dù học sinh tô đúng).
 const OMR_TEMPLATE = {
   // Số báo danh: 6 cột (mỗi cột 1 chữ số), 10 hàng (chữ số 0-9)
   sbd: {
-    cols: [0.56452, 0.59839, 0.63226, 0.66613, 0.70000, 0.73387],
-    rows: [0.13968, 0.15792, 0.17617, 0.19441, 0.21266, 0.23090, 0.24914, 0.26739, 0.28563, 0.30388]
+    cols: [0.57168, 0.60932, 0.64695, 0.68459, 0.72222, 0.75986],
+    rows: [0.11227, 0.13190, 0.15153, 0.17117, 0.19080, 0.21043, 0.23006, 0.24969, 0.26933, 0.28896]
   },
   // Mã đề: 3 cột, 10 hàng (dùng chung hàng với Số báo danh)
   made: {
-    cols: [0.79839, 0.83226, 0.86613],
-    rows: [0.13968, 0.15792, 0.17617, 0.19441, 0.21266, 0.23090, 0.24914, 0.26739, 0.28563, 0.30388]
+    cols: [0.83154, 0.86918, 0.90681],
+    rows: [0.11227, 0.13190, 0.15153, 0.17117, 0.19080, 0.21043, 0.23006, 0.24969, 0.26933, 0.28896]
   },
   // Phần I trắc nghiệm: 40 câu, chia 2 CỘT song song trên cùng 1 trang
   // (cột trái = câu 1-20, cột phải = câu 21-40), mỗi cột 4 ô A/B/C/D.
   // 2 cột dùng CHUNG 1 danh sách hàng (rows) vì được in ngang hàng nhau
   // trên phiếu - khớp với sheet_40cau (xem gen_sheet.py).
   phan1: {
-    colsLeft:  [0.12097, 0.15242, 0.18387, 0.21532], // câu 1-20 (A/B/C/D)
-    colsRight: [0.57258, 0.60403, 0.63548, 0.66694], // câu 21-40 (A/B/C/D)
-    rows: [0.36203, 0.38027, 0.39852, 0.41676, 0.43501, 0.45325, 0.47149, 0.48974, 0.50798, 0.52623,
-           0.55245, 0.57070, 0.58894, 0.60718, 0.62543, 0.64367, 0.66192, 0.68016, 0.69840, 0.71665]
+    colsLeft:  [0.07885, 0.11380, 0.14875, 0.18369], // câu 1-20 (A/B/C/D)
+    colsRight: [0.58065, 0.61559, 0.65054, 0.68548], // câu 21-40 (A/B/C/D)
+    rows: [0.35153, 0.37117, 0.39080, 0.41043, 0.43006, 0.44969, 0.46933, 0.48896, 0.50859, 0.52822,
+           0.55644, 0.57607, 0.59571, 0.61534, 0.63497, 0.65460, 0.67423, 0.69387, 0.71350, 0.73313]
   },
-  bubbleRadiusFrac: 0.00806, // bán kính lấy mẫu (tính theo % chiều rộng OUT_W), nhỏ hơn ô thật để không dính viền
+  bubbleRadiusFrac: 0.00896, // bán kính lấy mẫu (tính theo % chiều rộng OUT_W), nhỏ hơn ô thật để không dính viền
   fillThreshold: 90         // độ tối trung bình (0=trắng, 255=đen) để coi là "đã tô"
 };
 

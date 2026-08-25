@@ -623,7 +623,15 @@ const OMR_TEMPLATE = {
            0.55644, 0.57607, 0.59571, 0.61534, 0.63497, 0.65460, 0.67423, 0.69387, 0.71350, 0.73313]
   },
   bubbleRadiusFrac: 0.00896, // bán kính lấy mẫu (tính theo % chiều rộng OUT_W), nhỏ hơn ô thật để không dính viền
-  fillThreshold: 90         // độ tối trung bình (0=trắng, 255=đen) để coi là "đã tô"
+  // Nhận diện ô đã tô bằng cách SO SÁNH TƯƠNG ĐỐI giữa các ô trong cùng 1
+  // hàng (SBD/Mã Đề: cùng 1 cột; Phần I: cùng 1 câu), thay vì chỉ so với
+  // 1 ngưỡng cố định duy nhất - vì học sinh tô đậm/nhạt khác nhau (chì
+  // nhẹ tay, mực nhạt...) nên 1 ngưỡng tuyệt đối dễ bỏ sót ô tô nhạt.
+  // fillMinAbs: ô phải đậm hơn mức này (loại các vệt mờ/nhiễu giấy trắng)
+  // fillMargin: ô đậm nhất phải đậm hơn ô đậm-nhì ÍT NHẤT bằng này, để
+  //   chắc chắn là 1 lựa chọn rõ ràng (không phải 2 ô tô ngang nhau)
+  fillMinAbs: 45,
+  fillMargin: 20
 };
 
 // Đo độ tối trung bình của một vùng nhỏ quanh tâm ô tròn (0 = trắng, 255 = đen tuyệt đối)
@@ -658,6 +666,22 @@ function readGridDarkness(ctx, gridDef, outW, outH) {
   return darkness;
 }
 
+// Xác định trong 1 nhóm ô (vd: 6 ô A-F của 1 câu, hoặc 10 ô digit 0-9 của
+// 1 cột SBD) thì ô nào được coi là "đã tô", dựa trên so sánh TƯƠNG ĐỐI:
+// ô đậm nhất phải đủ đậm (>= fillMinAbs) VÀ đậm hơn hẳn ô đậm-nhì
+// (>= fillMargin) thì mới nhận. Trả về index ô được tô, hoặc -1 nếu
+// không xác định được (bỏ trống, hoặc 2+ ô đậm ngang nhau).
+function pickFilledIndex(vals) {
+  let maxV = -1, maxI = -1, secondV = -1;
+  vals.forEach((v, i) => {
+    if (v > maxV) { secondV = maxV; maxV = v; maxI = i; }
+    else if (v > secondV) { secondV = v; }
+  });
+  if (maxV < OMR_TEMPLATE.fillMinAbs) return -1;
+  if (maxV - secondV < OMR_TEMPLATE.fillMargin) return -1;
+  return maxI;
+}
+
 // Kiểm tra khối Số báo danh: mỗi cột (6 cột) phải có ĐÚNG 1 ô được tô.
 // Trả về { ok: boolean, sbdString: string|null, errorCols: number[] }
 function checkSBDGrid(ctx, outW, outH) {
@@ -666,15 +690,12 @@ function checkSBDGrid(ctx, outW, outH) {
   let sbdDigits = [];
 
   darkness.forEach((colVals, colIdx) => {
-    const filledRows = [];
-    colVals.forEach((d, rowIdx) => {
-      if (d >= OMR_TEMPLATE.fillThreshold) filledRows.push(rowIdx);
-    });
-    if (filledRows.length !== 1) {
+    const filledRow = pickFilledIndex(colVals);
+    if (filledRow === -1) {
       errorCols.push(colIdx + 1); // lưu số thứ tự cột (1-6) cho dễ đọc thông báo
       sbdDigits.push('?');
     } else {
-      sbdDigits.push(String(filledRows[0])); // filledRows[0] chính là chữ số 0-9
+      sbdDigits.push(String(filledRow)); // filledRow chính là chữ số 0-9
     }
   });
 
@@ -694,15 +715,12 @@ function checkMadeGrid(ctx, outW, outH) {
   let digits = [];
 
   darkness.forEach((colVals, colIdx) => {
-    const filledRows = [];
-    colVals.forEach((d, rowIdx) => {
-      if (d >= OMR_TEMPLATE.fillThreshold) filledRows.push(rowIdx);
-    });
-    if (filledRows.length !== 1) {
+    const filledRow = pickFilledIndex(colVals);
+    if (filledRow === -1) {
       errorCols.push(colIdx + 1);
       digits.push('?');
     } else {
-      digits.push(String(filledRows[0]));
+      digits.push(String(filledRow));
     }
   });
 
@@ -740,15 +758,13 @@ function checkPhan1Grid(ctx, outW, outH) {
   const ambiguousQuestions = []; // số thứ tự câu (1-based, 1..40) bị bỏ trống hoặc tô >1 đáp án
 
   function readOneQuestion(darkness, rowIdx, questionNumber) {
-    const filledCols = [];
-    darkness.forEach((colVals, colIdx) => {
-      if (colVals[rowIdx] >= OMR_TEMPLATE.fillThreshold) filledCols.push(colIdx);
-    });
-    if (filledCols.length === 1) {
-      answers.push(ANSWER_LETTERS[filledCols[0]]);
-    } else {
+    const vals = darkness.map(colVals => colVals[rowIdx]);
+    const filledCol = pickFilledIndex(vals);
+    if (filledCol === -1) {
       answers.push('');
       ambiguousQuestions.push(questionNumber);
+    } else {
+      answers.push(ANSWER_LETTERS[filledCol]);
     }
   }
 
@@ -782,10 +798,11 @@ function drawDebugOverlay(sourceCanvas, gridDef, outW, outH, darkness) {
 
   gridDef.cols.forEach((fx, colIdx) => {
     const px = fx * outW;
+    const winRow = pickFilledIndex(darkness[colIdx]);
     gridDef.rows.forEach((fy, rowIdx) => {
       const py = fy * outH;
       const d = darkness[colIdx][rowIdx];
-      const filled = d >= OMR_TEMPLATE.fillThreshold;
+      const filled = rowIdx === winRow;
       dctx.beginPath();
       dctx.arc(px, py, radius, 0, Math.PI * 2);
       dctx.strokeStyle = filled ? '#00ff00' : '#ff0000';
@@ -917,9 +934,7 @@ function finalizeUpload(dataUrl, sbdCheck, reading) {
 
 async function uploadToDrive(dataUrl, reading) {
   const base64 = dataUrl.split(',')[1];
-  const filename = (reading && reading.sbd)
-    ? ('SBD_' + reading.sbd + '.jpg')
-    : ('phieu_' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg');
+  const filename = 'phieu_' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
 
   try {
     const res = await fetch(WEBAPP_URL, {

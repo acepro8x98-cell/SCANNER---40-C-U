@@ -864,29 +864,7 @@ function showPreviewAndUpload(sbdCheck, madeCheck, phan1Check) {
     ambiguousQuestions: phan1Check.ambiguousQuestions // câu cần người chấm kiểm tra tay
   };
 
-  // CẢNH BÁO TRÙNG SBD TRONG PHIÊN NÀY: nếu SBD này đã quét thành công
-  // trước đó rồi (khác với phiếu đang cầm trên tay hiện tại), rất có thể
-  // 1 trong 2 học sinh đã tô NHẦM số báo danh. Không có phiếu nào được
-  // coi là "chắc chắn đúng" chỉ vì quét trước - dừng lại hỏi ngay, vì
-  // đây là lúc dễ xử lý nhất (phiếu giấy vẫn đang ở trên tay).
-  //
-  // QUAN TRỌNG: KHÔNG dùng confirm() của trình duyệt ở đây - trên điện
-  // thoại, khi confirm() hiện lên, trình duyệt thường TREO/CẮT AudioContext
-  // đang phát, nên tiếng "tè tè" cảnh báo bị mất dù gọi feedbackWarning()
-  // trước đó. Dùng hộp thoại tự vẽ (dupModal) để âm thanh phát trọn vẹn.
-  if (scannedSBDs.has(sbdCheck.sbdString)) {
-    feedbackWarning(); // "Tè tè" + rung cảnh báo - phát NGAY, không bị hộp thoại nào cắt ngang
-    showDuplicateModal(
-      sbdCheck.sbdString,
-      () => finalizeUpload(dataUrl, sbdCheck, reading), // Ghi đè
-      () => {
-        uploadStatusEl.textContent =
-          '⛔ Đã huỷ upload - kiểm tra lại SBD với học sinh rồi quét lại phiếu này.';
-        uploadStatusEl.className = 'upload-status error';
-      }
-    );
-    return;
-  }
+  // Việc kiểm tra SBD trùng do server (Apps Script) đảm nhiệm - xem uploadToDrive().
 
   finalizeUpload(dataUrl, sbdCheck, reading);
 }
@@ -894,12 +872,9 @@ function showPreviewAndUpload(sbdCheck, madeCheck, phan1Check) {
 // Hiện hộp thoại tự vẽ hỏi xác nhận SBD trùng (thay cho confirm() của
 // trình duyệt). onOverwrite/onCancel là callback ứng với 2 nút bấm.
 function showDuplicateModal(sbdString, onOverwrite, onCancel) {
-  dupMessageEl.textContent =
-    '⚠ SBD ' + sbdString + ' ĐÃ được quét trước đó trong phiên này!\n\n' +
-    'Bấm "Ghi đè" nếu đây là CHỤP LẠI phiếu vừa rồi (ảnh mờ/lỗi).\n' +
-    'Bấm "Huỷ" nếu đây là phiếu của HỌC SINH KHÁC - hãy kiểm tra lại SBD với ' +
-    'học sinh trước khi quét tiếp (cả 2 phiếu sẽ được lưu vào tab "SBD trùng" ' +
-    'trên Google Sheet để đối chiếu và gán lại SBD đúng sau).';
+  dupMessageEl.textContent = 'Số báo danh này đã trùng';
+  dupCancelBtn.textContent = 'Hủy';
+  dupOverwriteBtn.textContent = 'Ghi đè';
   dupModal.classList.remove('hidden');
 
   function cleanup() {
@@ -932,7 +907,7 @@ function finalizeUpload(dataUrl, sbdCheck, reading) {
   uploadToDrive(dataUrl, reading);
 }
 
-async function uploadToDrive(dataUrl, reading) {
+async function uploadToDrive(dataUrl, reading, overwrite = false) {
   const base64 = dataUrl.split(',')[1];
   const filename = (reading && reading.sbd ? reading.sbd : 'phieu_' + Date.now()) + '.jpg'; // tên ảnh = SBD (vd: 001112.jpg)
 
@@ -942,26 +917,34 @@ async function uploadToDrive(dataUrl, reading) {
       // Dùng text/plain để tránh trình duyệt gửi preflight OPTIONS
       // (Apps Script Web App không xử lý OPTIONS mặc định)
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ filename, mimeType: 'image/jpeg', data: base64, reading })
+      body: JSON.stringify({ filename, mimeType: 'image/jpeg', data: base64, reading, overwrite })
     });
 
     const result = await res.json();
     if (result && result.success) {
-      if (result.sheet && result.sheet.duplicate) {
-        // Server (Code.gs) phát hiện SBD này đã có dữ liệu từ trước (kể cả
-        // khi 2 điện thoại khác nhau cùng quét, hoặc quét cách nhau nhiều
-        // đợt - lớp bảo vệ này không phụ thuộc vào scannedSBDs của riêng
-        // trình duyệt này). Ảnh vẫn đã lưu vào Drive, chỉ là Sheet chính
-        // KHÔNG bị ghi đè - dữ liệu nằm ở tab "SBD trùng" chờ xử lý tay.
-        uploadStatusEl.textContent =
-          '⚠ Đã lưu ảnh, nhưng SBD ' + reading.sbd + ' TRÙNG với phiếu khác đã quét ' +
-          'trước đó (có thể từ máy khác) - xem tab "SBD trùng" trên Google Sheet ' +
-          'để đối chiếu và gán lại SBD đúng.';
-        uploadStatusEl.className = 'upload-status error';
-      } else {
-        uploadStatusEl.textContent = '✔ Đã lưu vào Google Drive';
-        uploadStatusEl.className = 'upload-status success';
+      if (result.duplicate) {
+        // Server báo SBD này đã có (dữ liệu trên Sheet hoặc ảnh trong Drive).
+        // Server CHƯA lưu gì cả -> hỏi người dùng: Hủy hay Ghi đè.
+        feedbackWarning();
+        showDuplicateModal(
+          reading.sbd,
+          () => { // Ghi đè: gửi lại kèm overwrite=true -> server xoá dữ liệu + ảnh cũ rồi lưu mới
+            uploadStatusEl.textContent = 'Đang ghi đè...';
+            uploadStatusEl.className = 'upload-status';
+            feedbackSuccess();
+            uploadToDrive(dataUrl, reading, true);
+          },
+          () => { // Hủy: coi như chưa chụp gì, dữ liệu cũ giữ nguyên
+            previewBox.classList.add('hidden');
+            history = [];
+            lockedUntil = Date.now() + CAPTURE_COOLDOWN;
+            setStatus('Đưa phiếu vào khung hình', false);
+          }
+        );
+        return;
       }
+      uploadStatusEl.textContent = '✔ Đã lưu vào Google Drive';
+      uploadStatusEl.className = 'upload-status success';
       // (Âm thanh "Tít" đã phát ngay lúc quét xong ở showPreviewAndUpload(),
       // không phát lại ở đây để tránh chờ mạng)
 

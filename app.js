@@ -934,7 +934,7 @@ function finalizeUpload(dataUrl, sbdCheck, reading) {
 
 async function uploadToDrive(dataUrl, reading) {
   const base64 = dataUrl.split(',')[1];
-  const filename = 'phieu_' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
+  const filename = (reading && reading.sbd ? reading.sbd : 'phieu_' + Date.now()) + '.jpg'; // tên ảnh = SBD (vd: 001112.jpg)
 
   try {
     const res = await fetch(WEBAPP_URL, {

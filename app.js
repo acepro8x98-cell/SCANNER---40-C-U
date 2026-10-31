@@ -496,7 +496,7 @@ function warpAndShow(fullCanvas, quadFull) {
 
     // Kiểm tra ngay các khối Số báo danh / Mã Đề / Phần I trên ảnh vừa duỗi thẳng
     const ctx2d = resultCanvas.getContext('2d');
-    currentBaseline = computeSheetBaseline(ctx2d, OUT_W, OUT_H);
+    prepareSheet(ctx2d, OUT_W, OUT_H); // tự căn lưới + mức nền cho riêng phiếu này
     const sbdCheck = checkSBDGrid(ctx2d, OUT_W, OUT_H);
     const madeCheck = checkMadeGrid(ctx2d, OUT_W, OUT_H);
     const phan1Check = checkPhan1Grid(ctx2d, OUT_W, OUT_H);
@@ -631,50 +631,135 @@ const OMR_TEMPLATE = {
   //   minOver : ô đậm nhất phải đậm hơn mức nền ít nhất bằng này
   //   ratio   : ô đậm-nhì phải gần mức nền: (nhất - nhì) >= ratio * (nhất - nền).
   //             Ô tô đơn có tỉ lệ ~1.0; tô đôi chỉ ~0.1 -> để trống (như trước).
-  minOver: 15,
-  ratio: 0.6
+  minOver: 10,
+  ratio: 0.5,
+  // Số câu thực sự in trên phiếu. Phiếu hiện chỉ có 20 câu (cột trái); cột phải (câu 21-40)
+  // không có ô tròn nên trước đây đọc nhầm chữ in/chữ viết tay thành đáp án rác.
+  // Nếu sau này in phiếu đủ 40 câu thì đổi thành 40.
+  activeQuestions: 20,
+  // Lấy mẫu & tự căn lưới (đơn vị: pixel trên ảnh OUT_W x OUT_H)
+  discRadius: 7,     // chỉ đo phần LÒNG ô tròn (bỏ viền in sẵn) -> bắt được cả ô tô nhạt
+  ringRadius: 11,    // bán kính viền ô tròn in sẵn, dùng để dò độ lệch lưới
+  searchRange: 16    // dò độ lệch lưới tối đa ±16px mỗi chiều
 };
 
-// Mức nền của phiếu đang đọc (tính 1 lần cho mỗi phiếu trong warpAndShow)
+// Mức nền của phiếu đang đọc (tính 1 lần cho mỗi phiếu trong prepareSheet)
 let currentBaseline = 0;
 
-function computeSheetBaseline(ctx, outW, outH) {
-  // Gộp mọi ô của SBD, Mã đề và cột trái Phần I: phần lớn là ô trống nên trung vị ~ mức nền giấy
-  const all = [];
-  const P = OMR_TEMPLATE;
-  [P.sbd, P.made, { cols: P.phan1.colsLeft, rows: P.phan1.rows }].forEach(g => {
-    readGridDarkness(ctx, g, outW, outH).forEach(col => col.forEach(v => all.push(v)));
-  });
-  all.sort((a, b) => a - b);
-  return all[Math.floor(all.length / 2)] || 0;
+// Ảnh xám của phiếu đã duỗi thẳng (đọc từ canvas 1 lần/phiếu, rồi mọi phép đo dùng mảng này)
+let sheetGray = null; // { data: Uint8Array, w, h }
+
+function buildSheetGray(ctx, w, h) {
+  const img = ctx.getImageData(0, 0, w, h).data;
+  const g = new Uint8Array(w * h);
+  for (let i = 0, j = 0; j < g.length; i += 4, j++) {
+    g[j] = (img[i] + img[i + 1] + img[i + 2]) / 3;
+  }
+  sheetGray = { data: g, w, h };
 }
 
-// Đo độ tối trung bình của một vùng nhỏ quanh tâm ô tròn (0 = trắng, 255 = đen tuyệt đối)
-function sampleBubbleDarkness(ctx, cx, cy, radius) {
-  const size = radius * 2;
-  const x0 = Math.max(0, Math.round(cx - radius));
-  const y0 = Math.max(0, Math.round(cy - radius));
-  const imgData = ctx.getImageData(x0, y0, size, size);
+// Các điểm (dx, dy) nằm trong hình tròn bán kính r
+function discOffsets(r) {
+  const pts = [];
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy <= r * r) pts.push([dx, dy]);
+    }
+  }
+  return pts;
+}
+const DISC_PTS = discOffsets(OMR_TEMPLATE.discRadius);
+
+// Độ tối trung bình (0 = trắng, 255 = đen) của LÒNG ô tròn quanh (cx, cy)
+function sampleBubbleDarkness(cx, cy) {
+  const { data, w, h } = sheetGray;
+  const x0 = Math.round(cx), y0 = Math.round(cy);
   let sum = 0, count = 0;
-  for (let i = 0; i < imgData.data.length; i += 4) {
-    const gray = (imgData.data[i] + imgData.data[i + 1] + imgData.data[i + 2]) / 3;
-    sum += (255 - gray);
+  for (const [dx, dy] of DISC_PTS) {
+    const x = x0 + dx, y = y0 + dy;
+    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+    sum += 255 - data[y * w + x];
     count++;
   }
   return count > 0 ? sum / count : 0;
 }
 
-// Đọc độ tối của toàn bộ 1 khối lưới (vd: sbd, made, phan1)
+// Điểm khớp: trung bình độ tối dọc theo VIỀN (đường tròn bán kính R) của mọi ô trong khối,
+// khi dịch lưới thêm (dx, dy). Lưới khớp đúng viền in sẵn thì điểm cao nhất.
+const RING_PTS = Array.from({ length: 12 }, (_, k) => {
+  const a = (k / 12) * Math.PI * 2;
+  return [Math.round(OMR_TEMPLATE.ringRadius * Math.cos(a)), Math.round(OMR_TEMPLATE.ringRadius * Math.sin(a))];
+}); // tính sẵn 1 lần (nhanh hơn gọi cos/sin hàng trăm nghìn lần)
+function ringScore(cells, dx, dy) {
+  const { data, w, h } = sheetGray;
+  let total = 0;
+  for (const [cx, cy] of cells) {
+    const bx = Math.round(cx + dx), by = Math.round(cy + dy);
+    for (const [ox, oy] of RING_PTS) {
+      const x = bx + ox, y = by + oy;
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+      total += 255 - data[y * w + x];
+    }
+  }
+  return total;
+}
+
+// Tìm độ lệch (dx, dy) của 1 khối lưới so với toạ độ mẫu: dò thô bước 3px rồi tinh ±2px
+function findGridOffset(gridDef, outW, outH) {
+  const cells = [];
+  for (const fx of gridDef.cols) for (const fy of gridDef.rows) cells.push([fx * outW, fy * outH]);
+  const range = OMR_TEMPLATE.searchRange;
+  let best = { s: -1, dx: 0, dy: 0 };
+  for (let dy = -range; dy <= range; dy += 3) {
+    for (let dx = -range; dx <= range; dx += 3) {
+      const s = ringScore(cells, dx, dy);
+      if (s > best.s) best = { s, dx, dy };
+    }
+  }
+  const c = { dx: best.dx, dy: best.dy };
+  for (let dy = c.dy - 2; dy <= c.dy + 2; dy++) {
+    for (let dx = c.dx - 2; dx <= c.dx + 2; dx++) {
+      const s = ringScore(cells, dx, dy);
+      if (s > best.s) best = { s, dx, dy };
+    }
+  }
+  return { dx: best.dx, dy: best.dy };
+}
+
+// Khối lưới của Phần I (dùng chung đối tượng để giữ độ lệch đã dò)
+const PHAN1_LEFT_DEF  = { cols: OMR_TEMPLATE.phan1.colsLeft,  rows: OMR_TEMPLATE.phan1.rows, off: { dx: 0, dy: 0 } };
+const PHAN1_RIGHT_DEF = { cols: OMR_TEMPLATE.phan1.colsRight, rows: OMR_TEMPLATE.phan1.rows, off: { dx: 0, dy: 0 } };
+OMR_TEMPLATE.sbd.off  = { dx: 0, dy: 0 };
+OMR_TEMPLATE.made.off = { dx: 0, dy: 0 };
+
+// Chuẩn bị đọc 1 phiếu: lấy ảnh xám, tự căn lại từng khối lưới (mỗi khối lệch khác nhau vì
+// ô vuông góc bị cắt mép/giấy cong), rồi tính mức nền. Gọi 1 lần trước các hàm check*.
+function prepareSheet(ctx, outW, outH) {
+  buildSheetGray(ctx, outW, outH);
+  OMR_TEMPLATE.sbd.off  = findGridOffset(OMR_TEMPLATE.sbd, outW, outH);
+  OMR_TEMPLATE.made.off = findGridOffset(OMR_TEMPLATE.made, outW, outH);
+  PHAN1_LEFT_DEF.off    = findGridOffset(PHAN1_LEFT_DEF, outW, outH);
+  PHAN1_RIGHT_DEF.off   = PHAN1_LEFT_DEF.off; // cột phải không có ô in sẵn để dò -> dùng độ lệch cột trái
+
+  // Mức nền = trung vị độ tối của mọi ô (SBD, Mã đề, cột trái): phần lớn là ô trống
+  const all = [];
+  [OMR_TEMPLATE.sbd, OMR_TEMPLATE.made, PHAN1_LEFT_DEF].forEach(g => {
+    readGridDarkness(null, g, outW, outH).forEach(col => col.forEach(v => all.push(v)));
+  });
+  all.sort((a, b) => a - b);
+  currentBaseline = all[Math.floor(all.length / 2)] || 0;
+}
+
+// Đọc độ tối của toàn bộ 1 khối lưới (vd: sbd, made, phan1), đã cộng độ lệch đã dò
 // Trả về mảng 2 chiều: darkness[colIndex][rowIndex]
 function readGridDarkness(ctx, gridDef, outW, outH) {
-  const radius = Math.max(3, Math.round(outW * OMR_TEMPLATE.bubbleRadiusFrac));
+  const off = gridDef.off || { dx: 0, dy: 0 };
   const darkness = [];
   for (const fx of gridDef.cols) {
     const colVals = [];
-    const px = fx * outW;
+    const px = fx * outW + off.dx;
     for (const fy of gridDef.rows) {
-      const py = fy * outH;
-      colVals.push(sampleBubbleDarkness(ctx, px, py, radius));
+      colVals.push(sampleBubbleDarkness(px, fy * outH + off.dy));
     }
     darkness.push(colVals);
   }
@@ -683,8 +768,8 @@ function readGridDarkness(ctx, gridDef, outW, outH) {
 
 // Xác định trong 1 nhóm ô (vd: 6 ô A-F của 1 câu, hoặc 10 ô digit 0-9 của
 // 1 cột SBD) thì ô nào được coi là "đã tô", dựa trên so sánh TƯƠNG ĐỐI:
-// ô đậm nhất phải đủ đậm (>= fillMinAbs) VÀ đậm hơn hẳn ô đậm-nhì
-// (>= fillMargin) thì mới nhận. Trả về index ô được tô, hoặc -1 nếu
+// ô đậm nhất phải đủ đậm so với mức nền (minOver) VÀ đậm hơn hẳn ô đậm-nhì
+// (ratio) thì mới nhận. Trả về index ô được tô, hoặc -1 nếu
 // không xác định được (bỏ trống, hoặc 2+ ô đậm ngang nhau).
 function pickFilledIndex(vals) {
   let maxV = -1, maxI = -1, secondV = -1;
@@ -762,8 +847,10 @@ const ANSWER_LETTERS = ['A', 'B', 'C', 'D'];
 // đọc riêng từng cột-nhóm (trái/phải) của Phần I.
 function readPhan1Darkness(ctx, outW, outH) {
   const rows = OMR_TEMPLATE.phan1.rows;
-  const left  = readGridDarkness(ctx, { cols: OMR_TEMPLATE.phan1.colsLeft,  rows }, outW, outH);
-  const right = readGridDarkness(ctx, { cols: OMR_TEMPLATE.phan1.colsRight, rows }, outW, outH);
+  const left  = readGridDarkness(ctx, PHAN1_LEFT_DEF, outW, outH);
+  const right = OMR_TEMPLATE.activeQuestions > 20
+    ? readGridDarkness(ctx, PHAN1_RIGHT_DEF, outW, outH)
+    : null; // phiếu 20 câu: không đọc cột phải (tránh đọc nhầm chữ thành đáp án)
   return { left, right }; // mỗi bên: darkness[colIdx][rowIdx], colIdx 0..3 = A..D
 }
 
@@ -788,9 +875,13 @@ function checkPhan1Grid(ctx, outW, outH) {
   for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
     readOneQuestion(left, rowIdx, rowIdx + 1);
   }
-  // Cột phải: câu 21-40
+  // Cột phải: câu 21-40 (chỉ đọc khi phiếu thật sự có; còn lại để trống cho đủ 40 phần tử)
   for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
-    readOneQuestion(right, rowIdx, rowIdx + 21);
+    if (right) {
+      readOneQuestion(right, rowIdx, rowIdx + 21);
+    } else {
+      answers.push('');
+    }
   }
 
   return { answers, ambiguousQuestions, darkness: { left, right } };
@@ -813,10 +904,10 @@ function drawDebugOverlay(sourceCanvas, gridDef, outW, outH, darkness) {
   const radius = Math.max(3, Math.round(outW * OMR_TEMPLATE.bubbleRadiusFrac));
 
   gridDef.cols.forEach((fx, colIdx) => {
-    const px = fx * outW;
+    const px = fx * outW + ((gridDef.off && gridDef.off.dx) || 0);
     const winRow = pickFilledIndex(darkness[colIdx]);
     gridDef.rows.forEach((fy, rowIdx) => {
-      const py = fy * outH;
+      const py = fy * outH + ((gridDef.off && gridDef.off.dy) || 0);
       const d = darkness[colIdx][rowIdx];
       const filled = rowIdx === winRow;
       dctx.beginPath();

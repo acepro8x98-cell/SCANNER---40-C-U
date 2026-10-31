@@ -27,11 +27,11 @@ const overlayCtx = overlay.getContext('2d');
 
 // ---------- Cấu hình thuật toán ----------
 const PROC_WIDTH        = 640;   // độ rộng ảnh xử lý (tăng lên để 4 ô vuông góc đủ lớn để nhận ra)
-const PROCESS_INTERVAL  = 70;    // ms giữa các lần xử lý (~14 khung hình/giây, tăng từ 90ms để phản hồi nhanh hơn)
+const PROCESS_INTERVAL  = 90;    // ms NGHỈ giữa 2 lần xử lý (tính sau khi xử lý xong, nên máy chậm không bị dồn việc)
 const MIN_AREA_RATIO    = 0.10;  // phiếu phải chiếm tối thiểu 10% diện tích khung hình
 const ASPECT_TARGETS    = [210/297, 297/210]; // A4 dọc và ngang
 const ASPECT_TOLERANCE  = 0.22;
-const STABLE_WINDOW_MS  = 350;   // thời gian phải đứng yên trước khi tự chụp (giảm từ 600ms để chụp nhanh hơn)
+const STABLE_WINDOW_MS  = 600;   // phiếu phải đứng yên ít nhất ~0,5s (tính theo THỜI GIAN, không đếm số khung hình)
 const STABLE_PIXEL_TOL  = 14;    // sai lệch tối đa (px) giữa các khung (tăng từ 8 để chịu được tay rung nhẹ)
 const CAPTURE_COOLDOWN  = 2500;  // ms khoá lại sau khi vừa chụp, tránh chụp liên tục
 const OUT_W = 1240, OUT_H = 1754; // kích thước ảnh xuất ra (~A4 150dpi)
@@ -41,9 +41,10 @@ const OUT_W = 1240, OUT_H = 1754; // kích thước ảnh xuất ra (~A4 150dpi)
 // hơn nhiều so với việc dò viền cả tờ giấy (không bị ảnh hưởng bởi nền phía sau).
 const MARKER_MIN_SIDE_RATIO = 0.010; // cạnh ô vuông tối thiểu, tính theo % chiều rộng ảnh xử lý
 const MARKER_MAX_SIDE_RATIO = 0.10;  // cạnh ô vuông tối đa
-const MARKER_ASPECT_MIN     = 0.50;  // ô vuông thật sẽ có tỉ lệ cạnh gần 1:1 (nới ra để chịu mờ/nghiêng nhẹ)
-const MARKER_ASPECT_MAX     = 2.0;
-const MARKER_MIN_EXTENT     = 0.70;  // độ "đặc" của khối (giảm từ 0.80 để chịu ảnh hơi mờ làm mòn viền)
+const MARKER_ASPECT_MIN     = 0.60;  // ô vuông thật sẽ có tỉ lệ cạnh gần 1:1 (nới ra để chịu mờ/nghiêng nhẹ)
+const MARKER_ASPECT_MAX     = 1.67;
+const MARKER_MIN_EXTENT     = 0.70;  // độ "đặc" của khối (ô vuông 10px chỉ đo được ~0.8)
+const MARKER_ASPECT_TOL     = 0.12;  // khung 4 ô vuông phải có tỉ lệ A4 (sai số 12%) - nếu thiếu 1 góc sẽ bị loại
 
 // ---------- Biến trạng thái ----------
 let cvReady = false;
@@ -54,6 +55,7 @@ let history = [];            // lịch sử {t, pts} để kiểm tra ổn đị
 let autoCaptureEnabled = true;
 let lockedUntil = 0;         // thời điểm hết khoá sau khi chụp
 let loopTimer = null;
+let fullCanvas = null;       // canvas chụp ảnh gốc, DÙNG LẠI mỗi lần quét (tránh rò bộ nhớ trên điện thoại)
 let isBusy = false;
 let lastMarkerDebug = { candidates: [] }; // để hiển thị debug: các ô vuông đang "nhìn thấy"
 
@@ -141,7 +143,12 @@ function pollAgain() {
 function onOpenCVReady() {
   cvReady = true;
   setStatus('Đưa phiếu vào khung hình');
-  loopTimer = setInterval(processFrame, PROCESS_INTERVAL);
+  // Tự hẹn giờ lại SAU KHI xử lý xong 1 khung (thay vì setInterval) để máy chậm không bị dồn việc
+  const loop = () => {
+    processFrame();
+    loopTimer = setTimeout(loop, PROCESS_INTERVAL);
+  };
+  loop();
 }
 
 // ============================================================
@@ -155,35 +162,15 @@ function processFrame() {
   procCtx.drawImage(video, 0, 0, procCanvas.width, procCanvas.height);
 
   const frameArea = procCanvas.width * procCanvas.height;
-  let src, gray, blurred, edge, dilated, contours, hierarchy;
+  let src, gray;
   try {
     src = cv.imread(procCanvas);
     gray = new cv.Mat();
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-    // CÁCH 1 (ưu tiên): tìm 4 ô vuông đen in sẵn ở góc phiếu
-    let quad = findMarkerQuad(gray, frameArea);
-
-    // CÁCH 2 (dự phòng): nếu không thấy đủ 4 ô vuông, quay lại dò viền cả tờ giấy
-    if (!quad) {
-      blurred = new cv.Mat();
-      cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
-
-      edge = new cv.Mat();
-      cv.Canny(blurred, edge, 60, 180);
-
-      // Giãn nhẹ để nối các đoạn cạnh bị đứt
-      dilated = new cv.Mat();
-      const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
-      cv.dilate(edge, dilated, kernel);
-      kernel.delete();
-
-      contours = new cv.MatVector();
-      hierarchy = new cv.Mat();
-      cv.findContours(dilated, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-      quad = findBestQuad(contours, frameArea);
-    }
+    // Chỉ dùng 4 ô vuông đen ở góc phiếu. Thiếu 1 góc là KHÔNG chụp (tránh lệch lưới
+    // làm đọc sai/bỏ sót câu). Đã bỏ cách dự phòng dò viền giấy vì nặng và kém chính xác.
+    const quad = findMarkerQuad(gray, frameArea);
 
     if (quad) {
       lastQuadProc = quad;
@@ -194,7 +181,7 @@ function processFrame() {
       drawOverlay(null, false); // vẫn vẽ các chấm vàng debug (ô vuông đã thấy nhưng chưa đủ 4)
       history = [];
       const n = lastMarkerDebug.candidates.length;
-      setStatus(`Đưa phiếu vào khung hình (thấy ${n} ô vuông)`, false);
+      setStatus(`Chưa thấy đủ 4 ô vuông góc (thấy ${n}) - hãy lùi máy, chừa lề quanh phiếu`, false);
     }
   } catch (err) {
     // QUAN TRỌNG: hiện lỗi thật ra màn hình thay vì để lỗi ẩn trong console
@@ -203,7 +190,7 @@ function processFrame() {
     console.error('processFrame error:', err);
   } finally {
     // Giải phóng bộ nhớ OpenCV (bắt buộc, tránh rò rỉ)
-    [src, gray, blurred, edge, dilated, contours, hierarchy].forEach(m => m && m.delete && m.delete());
+    [src, gray].forEach(m => m && m.delete && m.delete());
   }
 }
 
@@ -227,7 +214,7 @@ function findMarkerQuad(gray, frameArea) {
 
     contours = new cv.MatVector();
     hierarchy = new cv.Mat();
-    cv.findContours(bin, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+    cv.findContours(bin, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE); // EXTERNAL: ít đường viền hơn -> nhanh hơn
 
     const w = gray.cols;
     const minSide = w * MARKER_MIN_SIDE_RATIO;
@@ -260,19 +247,30 @@ function findMarkerQuad(gray, frameArea) {
       return null;
     }
 
-    // Loại bỏ nhiễu: chỉ giữ các khối có kích thước gần với kích thước phổ biến nhất
-    const sizes = candidates.map(c => c.size).sort((a, b) => a - b);
-    const medianSize = sizes[Math.floor(sizes.length / 2)];
-    const filtered = candidates.filter(c => c.size > medianSize * 0.4 && c.size < medianSize * 2.5);
-    const pool = filtered.length >= 4 ? filtered : candidates;
-    lastMarkerDebug.candidates = pool;
+    lastMarkerDebug.candidates = candidates;
 
     // 4 ô vuông góc luôn là các điểm CỰC TRỊ (trên-trái, trên-phải, dưới-phải, dưới-trái)
-    const ordered = orderPoints(pool);
+    const sums  = candidates.map(c => c.x + c.y);
+    const diffs = candidates.map(c => c.y - c.x);
+    const idx = [
+      sums.indexOf(Math.min(...sums)),    // trên-trái
+      diffs.indexOf(Math.min(...diffs)),  // trên-phải
+      sums.indexOf(Math.max(...sums)),    // dưới-phải
+      diffs.indexOf(Math.max(...diffs))   // dưới-trái
+    ];
+    if (new Set(idx).size < 4) return null; // 1 khối bị chọn làm 2 góc -> thiếu góc
 
-    // Kiểm tra lại: diện tích đủ lớn + tỉ lệ khung gần A4 (loại các trường hợp trùng khớp ngẫu nhiên)
+    // 4 ô vuông in cùng kích thước: nếu có khối lệch cỡ (vd chữ, ô đen to của bảng SBD) -> thiếu 1 góc thật
+    const corners = idx.map(i => candidates[i]);
+    const sz = corners.map(c => c.size).sort((a, b) => a - b);
+    const medSize = (sz[1] + sz[2]) / 2;
+    if (corners.some(c => c.size < medSize * 0.7 || c.size > medSize * 1.4)) return null;
+
+    const ordered = corners.map(c => ({ x: c.x, y: c.y }));
+
+    // Diện tích đủ lớn + tỉ lệ khung 4 ô vuông phải gần A4 (siết chặt hơn trước)
     if (polygonArea(ordered) < frameArea * MIN_AREA_RATIO) return null;
-    if (!aspectRatioOk(ordered)) return null;
+    if (!aspectRatioOk(ordered, MARKER_ASPECT_TOL)) return null;
 
     return ordered;
   } finally {
@@ -339,7 +337,7 @@ function orderPoints(pts) {
 }
 
 // BƯỚC 18: kiểm tra tỉ lệ khung gần với A4 (0.707) ở cả 2 chiều
-function aspectRatioOk([tl, tr, br, bl]) {
+function aspectRatioOk([tl, tr, br, bl], tol = ASPECT_TOLERANCE) {
   const widthTop    = dist(tl, tr);
   const widthBottom  = dist(bl, br);
   const heightLeft   = dist(tl, bl);
@@ -348,7 +346,7 @@ function aspectRatioOk([tl, tr, br, bl]) {
   const h = (heightLeft + heightRight) / 2;
   if (w < 10 || h < 10) return false;
   const ratio = w / h;
-  return ASPECT_TARGETS.some(t => Math.abs(ratio - t) < t * ASPECT_TOLERANCE);
+  return ASPECT_TARGETS.some(t => Math.abs(ratio - t) < t * tol);
 }
 
 function dist(a, b) {
@@ -417,19 +415,23 @@ function procToOverlay(p) {
 function trackStability(quad) {
   const now = Date.now();
   history.push({ t: now, pts: quad });
-  history = history.filter(h => now - h.t <= STABLE_WINDOW_MS);
+  history = history.filter(h => now - h.t <= STABLE_WINDOW_MS + 200);
 
-  if (history.length < 3) {
+  // Phải có dữ liệu đủ lâu (theo thời gian), không phụ thuộc máy xử lý nhanh hay chậm
+  const span = now - history[0].t;
+  if (history.length < 2 || span < STABLE_WINDOW_MS * 0.8) {
     setStatus('Đang căn chỉnh...', false);
     return;
   }
 
-  const first = history[0].pts;
+  // Mọi khung trong cửa sổ phải gần với khung mới nhất
   const last = history[history.length - 1].pts;
-  const maxMove = Math.max(...first.map((p, i) => dist(p, last[i])));
-  const longEnough = (last === history[history.length-1].pts) && (now - history[0].t >= STABLE_WINDOW_MS * 0.8);
+  let maxMove = 0;
+  for (const h of history) {
+    for (let i = 0; i < 4; i++) maxMove = Math.max(maxMove, dist(h.pts[i], last[i]));
+  }
 
-  if (maxMove <= STABLE_PIXEL_TOL && longEnough) {
+  if (maxMove <= STABLE_PIXEL_TOL) {
     setStatus('✔ Đã ổn định', true);
     if (autoCaptureEnabled && Date.now() >= lockedUntil) {
       triggerCapture();
@@ -457,7 +459,7 @@ function triggerCapture() {
   lockedUntil = Date.now() + CAPTURE_COOLDOWN;
 
   // Chụp ở ĐỘ PHÂN GIẢI GỐC của camera để ảnh nét, không dùng canvas nhỏ đã xử lý
-  const fullCanvas = document.createElement('canvas');
+  if (!fullCanvas) fullCanvas = document.createElement('canvas'); // dùng lại 1 canvas duy nhất
   fullCanvas.width = video.videoWidth;
   fullCanvas.height = video.videoHeight;
   fullCanvas.getContext('2d').drawImage(video, 0, 0);
@@ -494,6 +496,7 @@ function warpAndShow(fullCanvas, quadFull) {
 
     // Kiểm tra ngay các khối Số báo danh / Mã Đề / Phần I trên ảnh vừa duỗi thẳng
     const ctx2d = resultCanvas.getContext('2d');
+    currentBaseline = computeSheetBaseline(ctx2d, OUT_W, OUT_H);
     const sbdCheck = checkSBDGrid(ctx2d, OUT_W, OUT_H);
     const madeCheck = checkMadeGrid(ctx2d, OUT_W, OUT_H);
     const phan1Check = checkPhan1Grid(ctx2d, OUT_W, OUT_H);
@@ -623,16 +626,28 @@ const OMR_TEMPLATE = {
            0.55644, 0.57607, 0.59571, 0.61534, 0.63497, 0.65460, 0.67423, 0.69387, 0.71350, 0.73313]
   },
   bubbleRadiusFrac: 0.00896, // bán kính lấy mẫu (tính theo % chiều rộng OUT_W), nhỏ hơn ô thật để không dính viền
-  // Nhận diện ô đã tô bằng cách SO SÁNH TƯƠNG ĐỐI giữa các ô trong cùng 1
-  // hàng (SBD/Mã Đề: cùng 1 cột; Phần I: cùng 1 câu), thay vì chỉ so với
-  // 1 ngưỡng cố định duy nhất - vì học sinh tô đậm/nhạt khác nhau (chì
-  // nhẹ tay, mực nhạt...) nên 1 ngưỡng tuyệt đối dễ bỏ sót ô tô nhạt.
-  // fillMinAbs: ô phải đậm hơn mức này (loại các vệt mờ/nhiễu giấy trắng)
-  // fillMargin: ô đậm nhất phải đậm hơn ô đậm-nhì ÍT NHẤT bằng này, để
-  //   chắc chắn là 1 lựa chọn rõ ràng (không phải 2 ô tô ngang nhau)
-  fillMinAbs: 45,
-  fillMargin: 20
+  // Nhận diện ô đã tô theo MỨC NỀN của từng phiếu (độ tối trung bình của giấy trắng + viền ô
+  // trong ảnh vừa chụp), nên ảnh xám/có bóng không làm sai ngưỡng:
+  //   minOver : ô đậm nhất phải đậm hơn mức nền ít nhất bằng này
+  //   ratio   : ô đậm-nhì phải gần mức nền: (nhất - nhì) >= ratio * (nhất - nền).
+  //             Ô tô đơn có tỉ lệ ~1.0; tô đôi chỉ ~0.1 -> để trống (như trước).
+  minOver: 15,
+  ratio: 0.6
 };
+
+// Mức nền của phiếu đang đọc (tính 1 lần cho mỗi phiếu trong warpAndShow)
+let currentBaseline = 0;
+
+function computeSheetBaseline(ctx, outW, outH) {
+  // Gộp mọi ô của SBD, Mã đề và cột trái Phần I: phần lớn là ô trống nên trung vị ~ mức nền giấy
+  const all = [];
+  const P = OMR_TEMPLATE;
+  [P.sbd, P.made, { cols: P.phan1.colsLeft, rows: P.phan1.rows }].forEach(g => {
+    readGridDarkness(ctx, g, outW, outH).forEach(col => col.forEach(v => all.push(v)));
+  });
+  all.sort((a, b) => a - b);
+  return all[Math.floor(all.length / 2)] || 0;
+}
 
 // Đo độ tối trung bình của một vùng nhỏ quanh tâm ô tròn (0 = trắng, 255 = đen tuyệt đối)
 function sampleBubbleDarkness(ctx, cx, cy, radius) {
@@ -677,8 +692,9 @@ function pickFilledIndex(vals) {
     if (v > maxV) { secondV = maxV; maxV = v; maxI = i; }
     else if (v > secondV) { secondV = v; }
   });
-  if (maxV < OMR_TEMPLATE.fillMinAbs) return -1;
-  if (maxV - secondV < OMR_TEMPLATE.fillMargin) return -1;
+  const over = maxV - currentBaseline;
+  if (over < OMR_TEMPLATE.minOver) return -1;                 // không có ô nào đủ đậm
+  if (maxV - secondV < OMR_TEMPLATE.ratio * over) return -1;   // 2+ ô đậm -> bỏ trống
   return maxI;
 }
 
@@ -785,7 +801,7 @@ function checkPhan1Grid(ctx, outW, outH) {
 // đúng tâm ô tròn không (chỉ hiển thị trên preview, KHÔNG upload)
 // Bật/tắt bằng biến DEBUG_OMR bên dưới.
 // ============================================================
-const DEBUG_OMR = true;
+const DEBUG_OMR = false; // bật true khi cần gỡ lỗi (tạo canvas lớn mỗi lần quét nên làm máy chậm dần)
 
 function drawDebugOverlay(sourceCanvas, gridDef, outW, outH, darkness) {
   const debugCanvas = document.createElement('canvas');
@@ -898,12 +914,6 @@ function finalizeUpload(dataUrl, sbdCheck, reading) {
   feedbackSuccess(); // "Tít" + rung nhẹ báo thành công
   scannedSBDs.add(sbdCheck.sbdString); // ghi nhận SBD này đã quét trong phiên
 
-  if (reading.ambiguousQuestions.length > 0) {
-    uploadStatusEl.textContent =
-      'Đang tải lên Google Drive... (câu ' + reading.ambiguousQuestions.join(', ') +
-      ' bỏ trống hoặc tô nhầm, cần kiểm tra tay)';
-  }
-
   uploadToDrive(dataUrl, reading);
 }
 
@@ -951,6 +961,7 @@ async function uploadToDrive(dataUrl, reading, overwrite = false) {
       // Tự động quay lại chế độ quét ngay sau khi lưu thành công,
       // để chụp phiếu tiếp theo mà không cần bấm "Chụp lại"
       setTimeout(() => {
+        previewImg.removeAttribute('src');
         previewBox.classList.add('hidden');
         history = [];
         lockedUntil = 0;
